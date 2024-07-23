@@ -1,11 +1,12 @@
 import argparse
 import logging
-import math
 import os
-from typing import Dict
-from pathvalidate import sanitize_filename
 import requests
 import hashlib
+from pathvalidate import sanitize_filename
+from typing import Optional
+import time
+import math
 
 
 logging.basicConfig(
@@ -19,23 +20,24 @@ logger = logging.getLogger("GoFile")
 
 
 class ProgressBar:
-    def __init__(self, name: str, cur: int, total: int) -> None:
-        self.reset(name, cur, total)
-
-    def reset(self, name: str, cur: int, total: int):
+    def __init__(self, name: str, total: int):
         self.name = name
-        self.cur = cur
         self.total = total
+        self.start_time = time.time()
+        self.current = 0
 
-    def print(self):
-        self.cur += 1
-        if self.cur <= self.total:
-            percentage = int(100 * self.cur // self.total)
-            fill = "█" * percentage
-            empty = " " * (100 - percentage)
-            print(f"\r {self.name}: {fill}{empty} {percentage}%", end="\r")
-        if self.cur == self.total:
-            print()
+    def update(self, chunk_size: int):
+        self.current += chunk_size
+        elapsed_time = time.time() - self.start_time
+        if elapsed_time > 0:
+            speed = self.current / elapsed_time / (1024 * 1024)  # MB/s
+            remaining_size = (self.total - self.current) / (1024 * 1024 * 1024)  # GB
+            percentage = 100 * self.current / self.total
+            filled_length = int(50 * self.current / self.total)
+            bar = '█' * filled_length + '-' * (50 - filled_length)
+            print(f'\r{self.name}: |{bar}| {percentage:.2f}% Speed: {speed:.2f} MB/s Remaining: {remaining_size:.2f} GB', end='')
+            if self.current >= self.total:
+                print()
 
 
 class GoFileMeta(type):
@@ -58,24 +60,24 @@ class GoFile(metaclass=GoFileMeta):
             data = requests.post("https://api.gofile.io/accounts").json()
             if data["status"] == "ok":
                 self.token = data["data"]["token"]
-                logger.info(f"updated token: {self.token}")
+                logger.info(f"Updated token: {self.token}")
             else:
-                raise Exception("cannot get token")
+                raise Exception("Cannot get token")
 
     def update_wt(self) -> None:
         if self.wt == "":
             alljs = requests.get("https://gofile.io/dist/js/alljs.js").text
             if 'wt: "' in alljs:
                 self.wt = alljs.split('wt: "')[1].split('"')[0]
-                logger.info(f"updated wt: {self.wt}")
+                logger.info(f"Updated wt: {self.wt}")
             else:
-                raise Exception("cannot get wt")
+                raise Exception("Cannot get wt")
 
-    def execute(self, dir: str, content_id: str = None, url: str = None, password: str = None) -> None:
+    def execute(self, dir: str, content_id: Optional[str] = None, url: Optional[str] = None, password: Optional[str] = None) -> None:
         if content_id is not None:
             self.update_token()
             self.update_wt()
-            hash_password = hashlib.sha256(password.encode()).hexdigest() if password != None else ""
+            hash_password = hashlib.sha256(password.encode()).hexdigest() if password else ""
             data = requests.get(
                 f"https://api.gofile.io/contents/{content_id}?wt={self.wt}&cache=true&password={hash_password}",
                 headers={
@@ -101,43 +103,41 @@ class GoFile(metaclass=GoFileMeta):
                         link = data["data"]["link"]
                         self.download(link, file)
                 else:
-                    logger.error(f"invalid password: {data['data'].get('passwordStatus')}")
+                    logger.error(f"Invalid password: {data['data'].get('passwordStatus')}")
         elif url is not None:
             if url.startswith("https://gofile.io/d/"):
                 self.execute(dir=dir, content_id=url.split("/")[-1], password=password)
             else:
-                logger.error(f"invalid url: {url}")
+                logger.error(f"Invalid URL: {url}")
         else:
-            logger.error(f"invalid parameters")
+            logger.error(f"Invalid parameters")
 
     def download(self, link: str, file: str, chunk_size: int = 8192):
-        try:
-            dir = os.path.dirname(file)
-            if not os.path.exists(dir):
-                os.makedirs(dir)
-            if not os.path.exists(file):
-                with requests.get(
-                    link, headers={"Cookie": "accountToken=" + self.token}, stream=True
-                ) as r:
-                    r.raise_for_status()
-                    with open(file, "wb") as f:
-                        content_length = int(r.headers["Content-Length"])
-                        progress_bar = ProgressBar(
-                            "Downloading", 0, math.ceil(content_length / chunk_size)
-                        )
-                        for chunk in r.iter_content(chunk_size=chunk_size):
-                            f.write(chunk)
-                            progress_bar.print()
-                    logger.info(f"downloaded: {file} ({link})")
-        except Exception as e:
-            logger.error(f"failed to download ({e}): {file} ({link})")
+      try:
+          dir = os.path.dirname(file)
+          if not os.path.exists(dir):
+              os.makedirs(dir)
+          if not os.path.exists(file):
+              with requests.get(
+                  link, headers={"Cookie": "accountToken=" + self.token}, stream=True
+              ) as r:
+                  r.raise_for_status()
+                  content_length = int(r.headers.get("Content-Length", 0))
+                  progress_bar = ProgressBar("Downloading", content_length)
+                  with open(file, "wb") as f:
+                      for chunk in r.iter_content(chunk_size=chunk_size):
+                          f.write(chunk)
+                          progress_bar.update(len(chunk))
+                  logger.info(f"Downloaded: {file} ({link})")
+      except Exception as e:
+          logger.error(f"Failed to download ({e}): {file} ({link})")
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument("url")
-parser.add_argument("-d", type=str, dest="dir", help="output directory")
-parser.add_argument("-p", type=str, dest="password", help="password")
+parser.add_argument("-d", type=str, dest="dir", help="Output directory")
+parser.add_argument("-p", type=str, dest="password", help="Password")
 args = parser.parse_args()
 if __name__ == "__main__":
-    dir = args.dir if args.dir is not None else "./output"
+    dir = args.dir if args.dir else "./output"
     GoFile().execute(dir=dir, url=args.url, password=args.password)
